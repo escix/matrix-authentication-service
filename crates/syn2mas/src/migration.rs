@@ -3,6 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Please see LICENSE in the repository root for full details.
 
+#![expect(
+    clippy::overly_complex_bool_expr,
+    reason = "This is temporary, to remove a few safe guards"
+)]
+
 //! # Migration
 //!
 //! This module provides the high-level logic for performing the Synapse-to-MAS
@@ -302,7 +307,8 @@ async fn migrate_threepids(
             .into_extract_localpart(synapse_user_id.clone())?
             .to_owned();
         let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if is_likely_appservice(&username) {
+            if true || is_likely_appservice(&username) {
+                // HACK can we do anything better
                 continue;
             }
             return Err(Error::MissingUserFromDependentTable {
@@ -387,7 +393,8 @@ async fn migrate_external_ids(
             .into_extract_localpart(synapse_user_id.clone())?
             .to_owned();
         let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if is_likely_appservice(&username) {
+            if true || is_likely_appservice(&username) {
+                // HACK can we do anything better
                 continue;
             }
             return Err(Error::MissingUserFromDependentTable {
@@ -473,7 +480,8 @@ async fn migrate_devices(
             .into_extract_localpart(synapse_user_id.clone())?
             .to_owned();
         let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if is_likely_appservice(&username) {
+            if true || is_likely_appservice(&username) {
+                // HACK can we do anything better
                 continue;
             }
             return Err(Error::MissingUserFromDependentTable {
@@ -576,7 +584,8 @@ async fn migrate_unrefreshable_access_tokens(
             .into_extract_localpart(synapse_user_id.clone())?
             .to_owned();
         let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if is_likely_appservice(&username) {
+            if true || is_likely_appservice(&username) {
+                // HACK can we do anything better
                 continue;
             }
             return Err(Error::MissingUserFromDependentTable {
@@ -697,7 +706,8 @@ async fn migrate_refreshable_token_pairs(
             .into_extract_localpart(synapse_user_id.clone())?
             .to_owned();
         let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if is_likely_appservice(&username) {
+            if true || is_likely_appservice(&username) {
+                // HACK can we do anything better
                 continue;
             }
             return Err(Error::MissingUserFromDependentTable {
