@@ -20,7 +20,8 @@ use mas_storage::Clock;
 use rand::RngCore;
 use thiserror::Error;
 use thiserror_ext::ContextInto;
-use tracing::Level;
+use tracing::{Level, Span};
+use tracing_indicatif::{span_ext::IndicatifSpanExt, style::ProgressStyle};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -123,15 +124,27 @@ struct MigrationState {
 /// - An underlying database access error, either to MAS or to Synapse.
 /// - Invalid data in the Synapse database.
 #[allow(clippy::implicit_hasher)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show))]
 pub async fn migrate(
-    synapse: &mut SynapseReader<'_>,
-    mas: &mut MasWriter,
+    mut synapse: SynapseReader<'_>,
+    mut mas: MasWriter,
     server_name: String,
     clock: &dyn Clock,
     rng: &mut impl RngCore,
     provider_id_mapping: HashMap<String, Uuid>,
 ) -> Result<(), Error> {
-    let counts = synapse.count_rows().await.into_synapse("counting users")?;
+    let span = Span::current();
+    // TODO this style is inconsistent with the child spans; it's just used because
+    // the default style doesn't seem to include the message?
+    span.pb_set_style(
+        &ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+        )
+        .unwrap(),
+    );
+    span.pb_set_message("counting work");
+    span.pb_set_length(7);
+    let counts = synapse.count_rows().await.into_synapse("counting rows")?;
 
     let mut state = MigrationState {
         server_name,
@@ -140,28 +153,79 @@ pub async fn migrate(
         provider_id_mapping,
     };
 
-    migrate_users(synapse, mas, &mut state, rng).await?;
-    migrate_threepids(synapse, mas, rng, &state).await?;
-    migrate_external_ids(synapse, mas, rng, &state).await?;
-    migrate_unrefreshable_access_tokens(synapse, mas, clock, rng, &mut state).await?;
-    migrate_refreshable_token_pairs(synapse, mas, clock, rng, &mut state).await?;
-    migrate_devices(synapse, mas, rng, &mut state).await?;
+    span.pb_set_message("migrating user rows");
+    span.pb_inc(1);
+    migrate_users(&mut synapse, &mut mas, counts.users, &mut state, rng).await?;
+    span.pb_set_message("migrating threepids");
+    span.pb_inc(1);
+    migrate_threepids(&mut synapse, &mut mas, counts.threepids, rng, &state).await?;
+    span.pb_set_message("migrating user external IDs");
+    span.pb_inc(1);
+    migrate_external_ids(&mut synapse, &mut mas, counts.external_ids, rng, &state).await?;
+    span.pb_set_message("migrating access tokens");
+    span.pb_inc(1);
+    migrate_unrefreshable_access_tokens(
+        &mut synapse,
+        &mut mas,
+        counts.access_tokens,
+        clock,
+        rng,
+        &mut state,
+    )
+    .await?;
+    span.pb_set_message("migrating refresh tokens");
+    span.pb_inc(1);
+    migrate_refreshable_token_pairs(
+        &mut synapse,
+        &mut mas,
+        counts.refresh_tokens,
+        clock,
+        rng,
+        &mut state,
+    )
+    .await?;
+    span.pb_set_message("migrating devices");
+    span.pb_inc(1);
+    migrate_devices(&mut synapse, &mut mas, counts.devices, rng, &mut state).await?;
+
+    span.pb_set_message("closing Synapse database");
+    span.pb_inc(1);
+    synapse
+        .finish()
+        .await
+        .into_synapse("failed to close Synapse reader")?;
+
+    span.pb_inc(1);
+    span.pb_set_message("finalising MAS database");
+    mas.finish()
+        .await
+        .into_mas("failed to finalise MAS database")?;
+
+    span.pb_set_message("migrated!");
+    span.pb_inc(1);
 
     Ok(())
 }
 
-#[tracing::instrument(skip_all, level = Level::INFO)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
 async fn migrate_users(
     synapse: &mut SynapseReader<'_>,
     mas: &mut MasWriter,
+    count_hint: usize,
     state: &mut MigrationState,
     rng: &mut impl RngCore,
 ) -> Result<(), Error> {
+    let span = Span::current();
+    span.pb_set_style(&ProgressStyle::default_bar());
+    span.pb_set_length(count_hint as u64);
+
     let mut user_buffer = MasWriteBuffer::new(MasWriter::write_users);
     let mut password_buffer = MasWriteBuffer::new(MasWriter::write_passwords);
     let mut users_stream = pin!(synapse.read_users());
 
     while let Some(user_res) = users_stream.next().await {
+        span.pb_inc(1);
+
         let user = user_res.into_synapse("reading user")?;
         let (mas_user, mas_password_opt) = transform_user(&user, &state.server_name, rng)?;
 
@@ -206,18 +270,25 @@ async fn migrate_users(
     Ok(())
 }
 
-#[tracing::instrument(skip_all, level = Level::INFO)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
 async fn migrate_threepids(
     synapse: &mut SynapseReader<'_>,
     mas: &mut MasWriter,
+    count_hint: usize,
     rng: &mut impl RngCore,
     state: &MigrationState,
 ) -> Result<(), Error> {
+    let span = Span::current();
+    span.pb_set_style(&ProgressStyle::default_bar());
+    span.pb_set_length(count_hint as u64);
+
     let mut email_buffer = MasWriteBuffer::new(MasWriter::write_email_threepids);
     let mut unsupported_buffer = MasWriteBuffer::new(MasWriter::write_unsupported_threepids);
     let mut users_stream = pin!(synapse.read_threepids());
 
     while let Some(threepid_res) = users_stream.next().await {
+        span.pb_inc(1);
+
         let SynapseThreepid {
             user_id: synapse_user_id,
             medium,
@@ -288,17 +359,24 @@ async fn migrate_threepids(
 ///
 /// - `provider_id_mapping`: mapping from Synapse `auth_provider` ID to UUID of
 ///   the upstream provider in MAS.
-#[tracing::instrument(skip_all, level = Level::INFO)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
 async fn migrate_external_ids(
     synapse: &mut SynapseReader<'_>,
     mas: &mut MasWriter,
+    count_hint: usize,
     rng: &mut impl RngCore,
     state: &MigrationState,
 ) -> Result<(), Error> {
+    let span = Span::current();
+    span.pb_set_style(&ProgressStyle::default_bar());
+    span.pb_set_length(count_hint as u64);
+
     let mut write_buffer = MasWriteBuffer::new(MasWriter::write_upstream_oauth_links);
     let mut extids_stream = pin!(synapse.read_user_external_ids());
 
     while let Some(extid_res) = extids_stream.next().await {
+        span.pb_inc(1);
+
         let SynapseExternalId {
             user_id: synapse_user_id,
             auth_provider,
@@ -362,17 +440,25 @@ async fn migrate_external_ids(
 ///
 /// This is because only access tokens store a timestamp that in any way
 /// resembles a creation timestamp.
-#[tracing::instrument(skip_all, level = Level::INFO)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
+#[allow(clippy::too_many_arguments)]
 async fn migrate_devices(
     synapse: &mut SynapseReader<'_>,
     mas: &mut MasWriter,
+    count_hint: usize,
     rng: &mut impl RngCore,
     state: &mut MigrationState,
 ) -> Result<(), Error> {
+    let span = Span::current();
+    span.pb_set_style(&ProgressStyle::default_bar());
+    span.pb_set_length(count_hint as u64);
+
     let mut devices_stream = pin!(synapse.read_devices());
     let mut write_buffer = MasWriteBuffer::new(MasWriter::write_compat_sessions);
 
     while let Some(device_res) = devices_stream.next().await {
+        span.pb_inc(1);
+
         let SynapseDevice {
             user_id: synapse_user_id,
             device_id,
@@ -455,19 +541,27 @@ async fn migrate_devices(
 
 /// Migrates unrefreshable access tokens (those without an associated refresh
 /// token). Some of these may be deviceless.
-#[tracing::instrument(skip_all, level = Level::INFO)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
+#[allow(clippy::too_many_arguments)]
 async fn migrate_unrefreshable_access_tokens(
     synapse: &mut SynapseReader<'_>,
     mas: &mut MasWriter,
+    count_hint: usize,
     clock: &dyn Clock,
     rng: &mut impl RngCore,
     state: &mut MigrationState,
 ) -> Result<(), Error> {
+    let span = Span::current();
+    span.pb_set_style(&ProgressStyle::default_bar());
+    span.pb_set_length(count_hint as u64);
+
     let mut token_stream = pin!(synapse.read_unrefreshable_access_tokens());
     let mut write_buffer = MasWriteBuffer::new(MasWriter::write_compat_access_tokens);
     let mut deviceless_session_write_buffer = MasWriteBuffer::new(MasWriter::write_compat_sessions);
 
     while let Some(token_res) = token_stream.next().await {
+        span.pb_inc(1);
+
         let SynapseAccessToken {
             user_id: synapse_user_id,
             device_id,
@@ -565,20 +659,28 @@ async fn migrate_unrefreshable_access_tokens(
 
 /// Migrates (access token, refresh token) pairs.
 /// Does not migrate non-refreshable access tokens.
-#[tracing::instrument(skip_all, level = Level::INFO)]
+#[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
+#[allow(clippy::too_many_arguments)]
 async fn migrate_refreshable_token_pairs(
     synapse: &mut SynapseReader<'_>,
     mas: &mut MasWriter,
+    count_hint: usize,
     clock: &dyn Clock,
     rng: &mut impl RngCore,
     state: &mut MigrationState,
 ) -> Result<(), Error> {
+    let span = Span::current();
+    span.pb_set_style(&ProgressStyle::default_bar());
+    span.pb_set_length(count_hint as u64);
+
     let mut token_stream = pin!(synapse.read_refreshable_token_pairs());
     let mut access_token_write_buffer = MasWriteBuffer::new(MasWriter::write_compat_access_tokens);
     let mut refresh_token_write_buffer =
         MasWriteBuffer::new(MasWriter::write_compat_refresh_tokens);
 
     while let Some(token_res) = token_stream.next().await {
+        span.pb_inc(1);
+
         let SynapseRefreshableTokenPair {
             user_id: synapse_user_id,
             device_id,
