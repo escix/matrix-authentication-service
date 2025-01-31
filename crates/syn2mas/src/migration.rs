@@ -302,10 +302,14 @@ async fn migrate_threepids(
         } = threepid_res.into_synapse("reading threepid")?;
         let created_at: DateTime<Utc> = added_at.into();
 
-        let username = synapse_user_id
+        let Ok(username) = synapse_user_id
             .extract_localpart(&state.server_name)
-            .into_extract_localpart(synapse_user_id.clone())?
-            .to_owned();
+            .into_extract_localpart(synapse_user_id.clone())
+            .map(str::to_owned)
+        else {
+            // HACK matrix.org
+            continue;
+        };
         let Some(user_infos) = state.users.get(username.as_str()).copied() else {
             if true || is_likely_appservice(&username) {
                 // HACK can we do anything better
