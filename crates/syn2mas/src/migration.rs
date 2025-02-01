@@ -26,7 +26,7 @@ use rand::RngCore;
 use thiserror::Error;
 use thiserror_ext::ContextInto;
 use tracing::{info, Level, Span};
-use tracing_indicatif::{span_ext::IndicatifSpanExt, style::ProgressStyle};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -139,16 +139,8 @@ pub async fn migrate(
     provider_id_mapping: HashMap<String, Uuid>,
 ) -> Result<(), Error> {
     let span = Span::current();
-    // TODO this style is inconsistent with the child spans; it's just used because
-    // the default style doesn't seem to include the message?
-    span.pb_set_style(
-        &ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
-        )
-        .unwrap(),
-    );
     span.pb_set_message("counting work");
-    span.pb_set_length(7);
+    span.pb_set_length(8);
     let counts = synapse.count_rows().await.into_synapse("counting rows")?;
 
     let mut state = MigrationState {
@@ -225,7 +217,6 @@ async fn migrate_users(
     let start = Instant::now();
 
     let span = Span::current();
-    span.pb_set_style(&ProgressStyle::default_bar());
     span.pb_set_length(count_hint as u64);
 
     let mut user_buffer = MasWriteBuffer::new(mas, MasWriter::write_users);
@@ -295,7 +286,6 @@ async fn migrate_threepids(
     let start = Instant::now();
 
     let span = Span::current();
-    span.pb_set_style(&ProgressStyle::default_bar());
     span.pb_set_length(count_hint as u64);
 
     let mut email_buffer = MasWriteBuffer::new(mas, MasWriter::write_email_threepids);
@@ -396,7 +386,6 @@ async fn migrate_external_ids(
     let start = Instant::now();
 
     let span = Span::current();
-    span.pb_set_style(&ProgressStyle::default_bar());
     span.pb_set_length(count_hint as u64);
 
     let mut write_buffer = MasWriteBuffer::new(mas, MasWriter::write_upstream_oauth_links);
@@ -486,7 +475,6 @@ async fn migrate_devices(
     let start = Instant::now();
 
     let span = Span::current();
-    span.pb_set_style(&ProgressStyle::default_bar());
     span.pb_set_length(count_hint as u64);
 
     let mut devices_stream = pin!(synapse.read_devices());
@@ -596,7 +584,6 @@ async fn migrate_unrefreshable_access_tokens(
     let start = Instant::now();
 
     let span = Span::current();
-    span.pb_set_style(&ProgressStyle::default_bar());
     span.pb_set_length(count_hint as u64);
 
     let mut token_stream = pin!(synapse.read_unrefreshable_access_tokens());
@@ -723,7 +710,6 @@ async fn migrate_refreshable_token_pairs(
     let start = Instant::now();
 
     let span = Span::current();
-    span.pb_set_style(&ProgressStyle::default_bar());
     span.pb_set_length(count_hint as u64);
 
     let mut token_stream = pin!(synapse.read_refreshable_token_pairs());
