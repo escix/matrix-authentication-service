@@ -6084,6 +6084,7 @@ dependencies = [
  "thiserror 2.0.11",
  "thiserror-ext",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-indicatif",
  "ulid",

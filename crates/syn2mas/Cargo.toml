@@ -19,6 +19,7 @@ serde.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 compact_str.workspace = true

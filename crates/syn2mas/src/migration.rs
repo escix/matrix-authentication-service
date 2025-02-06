@@ -20,11 +20,12 @@ use std::{pin::pin, time::Instant};
 
 use chrono::{DateTime, Utc};
 use compact_str::CompactString;
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt, StreamExt as _, TryStreamExt as _};
 use mas_storage::Clock;
 use rand::{RngCore, SeedableRng};
 use thiserror::Error;
 use thiserror_ext::ContextInto;
+use tokio_util::sync::PollSender;
 use tracing::{info, Level, Span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use ulid::Ulid;
@@ -61,6 +62,8 @@ pub enum Error {
         source: ExtractLocalpartError,
         user: FullUserId,
     },
+    #[error("channel closed")]
+    ChannelClosed,
     #[error("user {user} was not found for migration but a row in {table} was found for them")]
     MissingUserFromDependentTable { table: String, user: FullUserId },
     #[error("missing a mapping for the auth provider with ID {synapse_id:?} (used by {user} and maybe other users)")]
@@ -158,7 +161,7 @@ pub async fn migrate(
 
     span.pb_set_message("migrating user rows");
     span.pb_inc(1);
-    let (mut state, mut mas) = migrate_users(&mut synapse, mas, counts.users, state, rng).await?;
+    let (state, mut mas) = migrate_users(&mut synapse, mas, counts.users, state, rng).await?;
 
     span.pb_set_message("migrating threepids");
     span.pb_inc(1);
@@ -166,17 +169,19 @@ pub async fn migrate(
     span.pb_set_message("migrating user external IDs");
     span.pb_inc(1);
     migrate_external_ids(&mut synapse, &mut mas, counts.external_ids, rng, &state).await?;
+
     span.pb_set_message("migrating access tokens");
     span.pb_inc(1);
-    migrate_unrefreshable_access_tokens(
+    let (mut state, mut mas) = migrate_unrefreshable_access_tokens(
         &mut synapse,
-        &mut mas,
+        mas,
         counts.access_tokens,
         clock,
         rng,
-        &mut state,
+        state,
     )
     .await?;
+
     span.pb_set_message("migrating refresh tokens");
     span.pb_inc(1);
     migrate_refreshable_token_pairs(
@@ -188,6 +193,7 @@ pub async fn migrate(
         &mut state,
     )
     .await?;
+
     span.pb_set_message("migrating devices");
     span.pb_inc(1);
     migrate_devices(&mut synapse, &mut mas, counts.devices, rng, &mut state).await?;
@@ -221,7 +227,6 @@ async fn migrate_users(
 ) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let mut users_stream = pin!(synapse.read_users().with_progress_bar(count_hint, 10_000));
     let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
 
     let mut rng = rand_chacha::ChaCha8Rng::from_rng(rng).expect("failed to seed rng");
@@ -268,10 +273,12 @@ async fn migrate_users(
         Ok((state, mas))
     });
 
-    while let Some(user_res) = users_stream.next().await {
-        let user = user_res.into_synapse("reading user")?;
-        tx.send(user).await.expect("failed to send in channel");
-    }
+    synapse
+        .read_users()
+        .with_progress_bar(count_hint, 10_000)
+        .map_err(|e| e.into_synapse("reading users"))
+        .forward(PollSender::new(tx).sink_map_err(|_| Error::ChannelClosed))
+        .await?;
 
     let (state, mas) = task.await.expect("task panicked")?;
 
@@ -569,124 +576,136 @@ async fn migrate_devices(
 /// Migrates unrefreshable access tokens (those without an associated refresh
 /// token). Some of these may be deviceless.
 #[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 async fn migrate_unrefreshable_access_tokens(
     synapse: &mut SynapseReader<'_>,
-    mas: &mut MasWriter,
+    mut mas: MasWriter,
     count_hint: usize,
     clock: &dyn Clock,
     rng: &mut impl RngCore,
-    state: &mut MigrationState,
-) -> Result<(), Error> {
+    mut state: MigrationState,
+) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let mut token_stream = pin!(synapse
-        .read_unrefreshable_access_tokens()
-        .with_progress_bar(count_hint, 10_000));
-    let mut write_buffer = MasWriteBuffer::new(mas, MasWriter::write_compat_access_tokens);
-    let mut deviceless_session_write_buffer =
-        MasWriteBuffer::new(mas, MasWriter::write_compat_sessions);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
 
-    while let Some(token_res) = token_stream.next().await {
-        let SynapseAccessToken {
-            user_id: synapse_user_id,
-            device_id,
-            token,
-            valid_until_ms,
-            last_validated,
-        } = token_res.into_synapse("reading Synapse access token")?;
+    let now = clock.now();
+    let mut rng = rand_chacha::ChaChaRng::from_rng(rng).expect("failed to seed rng");
+    let task = tokio::spawn(async move {
+        let mut write_buffer = MasWriteBuffer::new(&mas, MasWriter::write_compat_access_tokens);
+        let mut deviceless_session_write_buffer =
+            MasWriteBuffer::new(&mas, MasWriter::write_compat_sessions);
 
-        let username = synapse_user_id
-            .extract_localpart(&state.server_name)
-            .into_extract_localpart(synapse_user_id.clone())?
-            .to_owned();
-        let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if true || is_likely_appservice(&username) {
-                // HACK can we do anything better
+        while let Some(token) = rx.recv().await {
+            let SynapseAccessToken {
+                user_id: synapse_user_id,
+                device_id,
+                token,
+                valid_until_ms,
+                last_validated,
+            } = token;
+            let username = synapse_user_id
+                .extract_localpart(&state.server_name)
+                .into_extract_localpart(synapse_user_id.clone())?
+                .to_owned();
+            let Some(user_infos) = state.users.get(username.as_str()).copied() else {
+                if true || is_likely_appservice(&username) {
+                    // HACK can we do anything better
+                    continue;
+                }
+                return Err(Error::MissingUserFromDependentTable {
+                    table: "access_tokens".to_owned(),
+                    user: synapse_user_id,
+                });
+            };
+
+            if user_infos.flags.is_deactivated() || user_infos.flags.is_guest() {
                 continue;
             }
-            return Err(Error::MissingUserFromDependentTable {
-                table: "access_tokens".to_owned(),
-                user: synapse_user_id,
-            });
-        };
 
-        if user_infos.flags.is_deactivated() || user_infos.flags.is_guest() {
-            continue;
-        }
+            // It's not always accurate, but last_validated is *often* the creation time of
+            // the device If we don't have one, then use the current time as a
+            // fallback.
+            let created_at = last_validated.map_or_else(|| now, DateTime::from);
 
-        // It's not always accurate, but last_validated is *often* the creation time of
-        // the device If we don't have one, then use the current time as a
-        // fallback.
-        let created_at = last_validated.map_or_else(|| clock.now(), DateTime::from);
+            let session_id = if let Some(device_id) = device_id {
+                // Use the existing device_id if this is the second token for a device
+                *state
+                    .devices_to_compat_sessions
+                    .entry((user_infos.mas_user_id, CompactString::new(&device_id)))
+                    .or_insert_with(|| {
+                        Uuid::from(Ulid::from_datetime_with_source(created_at.into(), &mut rng))
+                    })
+            } else {
+                // If this is a deviceless access token, create a deviceless compat session
+                // for it (since otherwise we won't create one whilst migrating devices)
+                let deviceless_session_id =
+                    Uuid::from(Ulid::from_datetime_with_source(created_at.into(), &mut rng));
 
-        let session_id = if let Some(device_id) = device_id {
-            // Use the existing device_id if this is the second token for a device
-            *state
-                .devices_to_compat_sessions
-                .entry((user_infos.mas_user_id, CompactString::new(&device_id)))
-                .or_insert_with(|| {
-                    Uuid::from(Ulid::from_datetime_with_source(created_at.into(), rng))
-                })
-        } else {
-            // If this is a deviceless access token, create a deviceless compat session
-            // for it (since otherwise we won't create one whilst migrating devices)
-            let deviceless_session_id =
-                Uuid::from(Ulid::from_datetime_with_source(created_at.into(), rng));
+                deviceless_session_write_buffer
+                    .write(
+                        &mut mas,
+                        MasNewCompatSession {
+                            session_id: deviceless_session_id,
+                            user_id: user_infos.mas_user_id,
+                            device_id: None,
+                            human_name: None,
+                            created_at,
+                            is_synapse_admin: false,
+                            last_active_at: None,
+                            last_active_ip: None,
+                            user_agent: None,
+                        },
+                    )
+                    .await
+                    .into_mas("failed to write deviceless compat sessions")?;
 
-            deviceless_session_write_buffer
+                deviceless_session_id
+            };
+
+            let token_id = Uuid::from(Ulid::from_datetime_with_source(created_at.into(), &mut rng));
+
+            write_buffer
                 .write(
-                    mas,
-                    MasNewCompatSession {
-                        session_id: deviceless_session_id,
-                        user_id: user_infos.mas_user_id,
-                        device_id: None,
-                        human_name: None,
+                    &mut mas,
+                    MasNewCompatAccessToken {
+                        token_id,
+                        session_id,
+                        access_token: token,
                         created_at,
-                        is_synapse_admin: false,
-                        last_active_at: None,
-                        last_active_ip: None,
-                        user_agent: None,
+                        expires_at: valid_until_ms.map(DateTime::from),
                     },
                 )
                 .await
-                .into_mas("failed to write deviceless compat sessions")?;
-
-            deviceless_session_id
-        };
-
-        let token_id = Uuid::from(Ulid::from_datetime_with_source(created_at.into(), rng));
-
+                .into_mas("writing compat access tokens")?;
+        }
         write_buffer
-            .write(
-                mas,
-                MasNewCompatAccessToken {
-                    token_id,
-                    session_id,
-                    access_token: token,
-                    created_at,
-                    expires_at: valid_until_ms.map(DateTime::from),
-                },
-            )
+            .finish(&mut mas)
             .await
             .into_mas("writing compat access tokens")?;
-    }
+        deviceless_session_write_buffer
+            .finish(&mut mas)
+            .await
+            .into_mas("writing deviceless compat sessions")?;
 
-    write_buffer
-        .finish(mas)
-        .await
-        .into_mas("writing compat access tokens")?;
-    deviceless_session_write_buffer
-        .finish(mas)
-        .await
-        .into_mas("writing deviceless compat sessions")?;
+        Ok((state, mas))
+    });
+
+    synapse
+        .read_unrefreshable_access_tokens()
+        .with_progress_bar(count_hint, 10_000)
+        .map_err(|e| e.into_synapse("reading tokens"))
+        .forward(PollSender::new(tx).sink_map_err(|_| Error::ChannelClosed))
+        .await?;
+
+    let (state, mas) = task.await.expect("task crashed")?;
 
     info!(
         "non-refreshable access tokens migrated in {:.1}s",
         Instant::now().duration_since(start).as_secs_f64()
     );
 
-    Ok(())
+    Ok((state, mas))
 }
 
 /// Migrates (access token, refresh token) pairs.
