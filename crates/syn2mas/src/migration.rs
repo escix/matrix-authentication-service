@@ -165,14 +165,16 @@ pub async fn migrate(
 
     span.pb_set_message("migrating threepids");
     span.pb_inc(1);
-    let mas = migrate_threepids(&mut synapse, mas, counts.threepids, rng, &state).await?;
+    let (state, mas) = migrate_threepids(&mut synapse, mas, counts.threepids, rng, state).await?;
+
     span.pb_set_message("migrating user external IDs");
     span.pb_inc(1);
-    let mas = migrate_external_ids(&mut synapse, mas, counts.external_ids, rng, &state).await?;
+    let (state, mas) =
+        migrate_external_ids(&mut synapse, mas, counts.external_ids, rng, state).await?;
 
     span.pb_set_message("migrating access tokens");
     span.pb_inc(1);
-    let (mut state, mas) = migrate_unrefreshable_access_tokens(
+    let (state, mas) = migrate_unrefreshable_access_tokens(
         &mut synapse,
         mas,
         counts.access_tokens,
@@ -184,13 +186,13 @@ pub async fn migrate(
 
     span.pb_set_message("migrating refresh tokens");
     span.pb_inc(1);
-    let mas = migrate_refreshable_token_pairs(
+    let (state, mas) = migrate_refreshable_token_pairs(
         &mut synapse,
         mas,
         counts.refresh_tokens,
         clock,
         rng,
-        &mut state,
+        state,
     )
     .await?;
 
@@ -296,8 +298,8 @@ async fn migrate_threepids(
     mut mas: MasWriter,
     count_hint: usize,
     rng: &mut impl RngCore,
-    state: &MigrationState,
-) -> Result<MasWriter, Error> {
+    state: MigrationState,
+) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
     let mut email_buffer = MasWriteBuffer::new(&mas, MasWriter::write_email_threepids);
@@ -380,7 +382,7 @@ async fn migrate_threepids(
         Instant::now().duration_since(start).as_secs_f64()
     );
 
-    Ok(mas)
+    Ok((state, mas))
 }
 
 /// # Parameters
@@ -393,8 +395,8 @@ async fn migrate_external_ids(
     mut mas: MasWriter,
     count_hint: usize,
     rng: &mut impl RngCore,
-    state: &MigrationState,
-) -> Result<MasWriter, Error> {
+    state: MigrationState,
+) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
     let mut write_buffer = MasWriteBuffer::new(&mas, MasWriter::write_upstream_oauth_links);
@@ -461,7 +463,7 @@ async fn migrate_external_ids(
         Instant::now().duration_since(start).as_secs_f64()
     );
 
-    Ok(mas)
+    Ok((state, mas))
 }
 
 /// Migrate devices from Synapse to MAS (as compat sessions).
@@ -593,7 +595,6 @@ async fn migrate_devices(
 /// Migrates unrefreshable access tokens (those without an associated refresh
 /// token). Some of these may be deviceless.
 #[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 async fn migrate_unrefreshable_access_tokens(
     synapse: &mut SynapseReader<'_>,
     mut mas: MasWriter,
@@ -735,8 +736,8 @@ async fn migrate_refreshable_token_pairs(
     count_hint: usize,
     clock: &dyn Clock,
     rng: &mut impl RngCore,
-    state: &mut MigrationState,
-) -> Result<MasWriter, Error> {
+    mut state: MigrationState,
+) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
     let mut token_stream = pin!(synapse
@@ -833,7 +834,7 @@ async fn migrate_refreshable_token_pairs(
         Instant::now().duration_since(start).as_secs_f64()
     );
 
-    Ok(mas)
+    Ok((state, mas))
 }
 
 fn transform_user(
