@@ -196,7 +196,7 @@ pub async fn migrate(
 
     span.pb_set_message("migrating devices");
     span.pb_inc(1);
-    let mas = migrate_devices(&mut synapse, mas, counts.devices, rng, &mut state).await?;
+    let (_state, mas) = migrate_devices(&mut synapse, mas, counts.devices, rng, state).await?;
 
     span.pb_set_message("closing Synapse database");
     span.pb_inc(1);
@@ -479,100 +479,115 @@ async fn migrate_devices(
     mut mas: MasWriter,
     count_hint: usize,
     rng: &mut impl RngCore,
-    state: &mut MigrationState,
-) -> Result<MasWriter, Error> {
+    mut state: MigrationState,
+) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let mut devices_stream = pin!(synapse.read_devices().with_progress_bar(count_hint, 10_000));
-    let mut write_buffer = MasWriteBuffer::new(&mas, MasWriter::write_compat_sessions);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
 
-    while let Some(device_res) = devices_stream.next().await {
-        let SynapseDevice {
-            user_id: synapse_user_id,
-            device_id,
-            display_name,
-            last_seen,
-            ip,
-            user_agent,
-        } = device_res.into_synapse("reading Synapse device")?;
+    let mut rng = rand_chacha::ChaChaRng::from_rng(rng).expect("failed to seed rng");
+    let task = tokio::spawn(async move {
+        let mut write_buffer = MasWriteBuffer::new(&mas, MasWriter::write_compat_sessions);
 
-        let username = synapse_user_id
-            .extract_localpart(&state.server_name)
-            .into_extract_localpart(synapse_user_id.clone())?
-            .to_owned();
-        let Some(user_infos) = state.users.get(username.as_str()).copied() else {
-            if true || is_likely_appservice(&username) {
-                // HACK can we do anything better
+        while let Some(device) = rx.recv().await {
+            let SynapseDevice {
+                user_id: synapse_user_id,
+                device_id,
+                display_name,
+                last_seen,
+                ip,
+                user_agent,
+            } = device;
+            let username = synapse_user_id
+                .extract_localpart(&state.server_name)
+                .into_extract_localpart(synapse_user_id.clone())?
+                .to_owned();
+            let Some(user_infos) = state.users.get(username.as_str()).copied() else {
+                if true || is_likely_appservice(&username) {
+                    // HACK can we do anything better
+                    continue;
+                }
+                return Err(Error::MissingUserFromDependentTable {
+                    table: "devices".to_owned(),
+                    user: synapse_user_id,
+                });
+            };
+
+            if user_infos.flags.is_deactivated() || user_infos.flags.is_guest() {
                 continue;
             }
-            return Err(Error::MissingUserFromDependentTable {
-                table: "devices".to_owned(),
-                user: synapse_user_id,
-            });
-        };
 
-        if user_infos.flags.is_deactivated() || user_infos.flags.is_guest() {
-            continue;
-        }
-
-        let session_id = *state
-            .devices_to_compat_sessions
-            .entry((user_infos.mas_user_id, CompactString::new(&device_id)))
-            .or_insert_with(||
+            let session_id = *state
+                .devices_to_compat_sessions
+                .entry((user_infos.mas_user_id, CompactString::new(&device_id)))
+                .or_insert_with(||
                 // We don't have a creation time for this device (as it has no access token),
                 // so use now as a least-evil fallback.
-                Ulid::with_source(rng).into());
-        let created_at = Ulid::from(session_id).datetime().into();
+                Ulid::with_source(&mut rng).into());
+            let created_at = Ulid::from(session_id).datetime().into();
 
-        // As we're using a real IP type in the MAS database, it is possible
-        // that we encounter invalid IP addresses in the Synapse database.
-        // In that case, we should ignore them, but still log a warning.
-        // One special case: Synapse will record '-' as IP in some cases, we don't want
-        // to log about those
-        let last_active_ip = ip.filter(|ip| ip != "-").and_then(|ip| {
-            ip.parse()
-                .map_err(|e| {
-                    tracing::warn!(
-                        error = &e as &dyn std::error::Error,
-                        mxid = %synapse_user_id,
-                        %device_id,
-                        %ip,
-                        "Failed to parse device IP, ignoring"
-                    );
-                })
-                .ok()
-        });
+            // As we're using a real IP type in the MAS database, it is possible
+            // that we encounter invalid IP addresses in the Synapse database.
+            // In that case, we should ignore them, but still log a warning.
+            // One special case: Synapse will record '-' as IP in some cases, we don't want
+            // to log about those
+            let last_active_ip = ip.filter(|ip| ip != "-").and_then(|ip| {
+                ip.parse()
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = &e as &dyn std::error::Error,
+                            mxid = %synapse_user_id,
+                            %device_id,
+                            %ip,
+                            "Failed to parse device IP, ignoring"
+                        );
+                    })
+                    .ok()
+            });
+
+            // TODO skip access tokens for deactivated users
+            write_buffer
+                .write(
+                    &mut mas,
+                    MasNewCompatSession {
+                        session_id,
+                        user_id: user_infos.mas_user_id,
+                        device_id: Some(device_id),
+                        human_name: display_name,
+                        created_at,
+                        is_synapse_admin: user_infos.flags.is_synapse_admin(),
+                        last_active_at: last_seen.map(DateTime::from),
+                        last_active_ip,
+                        user_agent,
+                    },
+                )
+                .await
+                .into_mas("writing compat sessions")?;
+        }
 
         write_buffer
-            .write(
-                &mut mas,
-                MasNewCompatSession {
-                    session_id,
-                    user_id: user_infos.mas_user_id,
-                    device_id: Some(device_id),
-                    human_name: display_name,
-                    created_at,
-                    is_synapse_admin: user_infos.flags.is_synapse_admin(),
-                    last_active_at: last_seen.map(DateTime::from),
-                    last_active_ip,
-                    user_agent,
-                },
-            )
+            .finish(&mut mas)
             .await
             .into_mas("writing compat sessions")?;
-    }
 
-    write_buffer
-        .finish(&mut mas)
-        .await
-        .into_mas("writing compat sessions")?;
+        Ok((state, mas))
+    });
+
+    synapse
+        .read_devices()
+        .with_progress_bar(count_hint, 10_000)
+        .map_err(|e| e.into_synapse("reading devices"))
+        .forward(PollSender::new(tx).sink_map_err(|_| Error::ChannelClosed))
+        .await?;
+
+    let (state, mas) = task.await.expect("task panicked")?;
 
     info!(
         "devices migrated in {:.1}s",
         Instant::now().duration_since(start).as_secs_f64()
     );
 
-    Ok(mas)
+    Ok((state, mas))
 }
 
 /// Migrates unrefreshable access tokens (those without an associated refresh
