@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use compact_str::CompactString;
 use futures_util::StreamExt as _;
 use mas_storage::Clock;
-use rand::RngCore;
+use rand::{RngCore, SeedableRng};
 use thiserror::Error;
 use thiserror_ext::ContextInto;
 use tracing::{info, Level, Span};
@@ -133,7 +133,7 @@ struct MigrationState {
 #[tracing::instrument(skip_all, fields(indicatif.pb_show))]
 pub async fn migrate(
     mut synapse: SynapseReader<'_>,
-    mut mas: MasWriter,
+    mas: MasWriter,
     server_name: String,
     clock: &dyn Clock,
     rng: &mut impl RngCore,
@@ -144,7 +144,7 @@ pub async fn migrate(
     span.pb_set_length(8);
     let counts = synapse.count_rows().await.into_synapse("counting rows")?;
 
-    let mut state = MigrationState {
+    let state = MigrationState {
         server_name,
         // We oversize the hashmaps, as the estimates are innaccurate, and we would like to avoid
         // reallocations.
@@ -158,7 +158,8 @@ pub async fn migrate(
 
     span.pb_set_message("migrating user rows");
     span.pb_inc(1);
-    migrate_users(&mut synapse, &mut mas, counts.users, &mut state, rng).await?;
+    let (mut state, mut mas) = migrate_users(&mut synapse, mas, counts.users, state, rng).await?;
+
     span.pb_set_message("migrating threepids");
     span.pb_inc(1);
     migrate_threepids(&mut synapse, &mut mas, counts.threepids, rng, &state).await?;
@@ -213,65 +214,73 @@ pub async fn migrate(
 #[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
 async fn migrate_users(
     synapse: &mut SynapseReader<'_>,
-    mas: &mut MasWriter,
+    mut mas: MasWriter,
     count_hint: usize,
-    state: &mut MigrationState,
+    state: MigrationState,
     rng: &mut impl RngCore,
-) -> Result<(), Error> {
+) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let mut user_buffer = MasWriteBuffer::new(mas, MasWriter::write_users);
-    let mut password_buffer = MasWriteBuffer::new(mas, MasWriter::write_passwords);
     let mut users_stream = pin!(synapse.read_users().with_progress_bar(count_hint, 10_000));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
+
+    let mut rng = rand_chacha::ChaCha8Rng::from_rng(rng).expect("failed to seed rng");
+    let task = tokio::spawn(async move {
+        let mut user_buffer = MasWriteBuffer::new(&mas, MasWriter::write_users);
+        let mut password_buffer = MasWriteBuffer::new(&mas, MasWriter::write_passwords);
+
+        while let Some(user) = rx.recv().await {
+            let (mas_user, mas_password_opt) = transform_user(&user, &state.server_name, &mut rng)?;
+
+            let mut flags = UserFlags::empty();
+            if bool::from(user.admin) {
+                flags |= UserFlags::IS_SYNAPSE_ADMIN;
+            }
+            if bool::from(user.deactivated) {
+                flags |= UserFlags::IS_DEACTIVATED;
+            }
+            if bool::from(user.is_guest) {
+                flags |= UserFlags::IS_GUEST;
+            }
+
+            user_buffer
+                .write(&mut mas, mas_user)
+                .await
+                .into_mas("writing user")?;
+
+            if let Some(mas_password) = mas_password_opt {
+                password_buffer
+                    .write(&mut mas, mas_password)
+                    .await
+                    .into_mas("writing password")?;
+            }
+        }
+
+        user_buffer
+            .finish(&mut mas)
+            .await
+            .into_mas("writing users")?;
+        password_buffer
+            .finish(&mut mas)
+            .await
+            .into_mas("writing passwords")?;
+
+        Ok((state, mas))
+    });
 
     while let Some(user_res) = users_stream.next().await {
         let user = user_res.into_synapse("reading user")?;
-        let (mas_user, mas_password_opt) = transform_user(&user, &state.server_name, rng)?;
-
-        let mut flags = UserFlags::empty();
-        if bool::from(user.admin) {
-            flags |= UserFlags::IS_SYNAPSE_ADMIN;
-        }
-        if bool::from(user.deactivated) {
-            flags |= UserFlags::IS_DEACTIVATED;
-        }
-        if bool::from(user.is_guest) {
-            flags |= UserFlags::IS_GUEST;
-        }
-
-        state.users.insert(
-            CompactString::new(&mas_user.username),
-            UserInfo {
-                mas_user_id: mas_user.user_id,
-                flags,
-            },
-        );
-
-        user_buffer
-            .write(mas, mas_user)
-            .await
-            .into_mas("writing user")?;
-
-        if let Some(mas_password) = mas_password_opt {
-            password_buffer
-                .write(mas, mas_password)
-                .await
-                .into_mas("writing password")?;
-        }
+        tx.send(user).await.expect("failed to send in channel");
     }
 
-    user_buffer.finish(mas).await.into_mas("writing users")?;
-    password_buffer
-        .finish(mas)
-        .await
-        .into_mas("writing passwords")?;
+    let (state, mas) = task.await.expect("task panicked")?;
 
     info!(
         "users migrated in {:.1}s",
         Instant::now().duration_since(start).as_secs_f64()
     );
 
-    Ok(())
+    Ok((state, mas))
 }
 
 #[tracing::instrument(skip_all, fields(indicatif.pb_show), level = Level::INFO)]
