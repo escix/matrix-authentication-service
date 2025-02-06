@@ -236,7 +236,7 @@ async fn migrate_users(
 ) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10 * 1024 * 1024);
 
     let mut rng = rand_chacha::ChaCha8Rng::from_rng(rng).expect("failed to seed rng");
     let task = tokio::spawn(
@@ -496,7 +496,7 @@ async fn migrate_devices(
 ) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10 * 1024 * 1024);
 
     let mut rng = rand_chacha::ChaChaRng::from_rng(rng).expect("failed to seed rng");
     let task = tokio::spawn(
@@ -619,7 +619,7 @@ async fn migrate_unrefreshable_access_tokens(
 ) -> Result<(MigrationState, MasWriter), Error> {
     let start = Instant::now();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024 * 1024);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10 * 1024 * 1024);
 
     let now = clock.now();
     let mut rng = rand_chacha::ChaChaRng::from_rng(rng).expect("failed to seed rng");
